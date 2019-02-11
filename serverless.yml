@@ -1,26 +1,167 @@
 service:
-  name: api-gateway-websocket-sandbox
-  stage: dev
-  websocketApiRouteSelectionExpression: $request.body.action
+  name: websockets-service
 
-# Add the serverless-webpack plugin
+# Pin the version to avoid version issues (& to ensure older, buggier versions are not used)
+frameworkVersion: '>=1.35 <2.0.0'
+
 plugins:
-  - serverless-webpack
+  # The order here is important! `serverless-webpack` must precede `serverless-offline`
+#  - serverless-webpack
+#  - serverless-offline        # emulates lambda & api gw
   - serverless-websockets-plugin
 
+#package:
+#  individually: true
+#  # Remove package:exclude completely. sls-webpack does its own optimized packaging
+#  # and only includes the needed files
+
+custom:
+#  env: ${file(./env.${self:provider.stage}.yml)}
+  package: ${file(./package.json)}
+  runtime: nodejs8.10
+#  dynamodb:
+#    start:
+#      migrate: true
+#  webpack:
+#    webpackConfig: ./webpack.config.js
+#    includeModules: true  # enable auto-packing of external modules
+#    packager: 'yarn'
+
+provider:
+  name: aws
+  profile: stefan
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'eu-west-1'}
+  deploymentBucket:
+    name: stefan.${self:provider.region}.serverless.deploys
+    serverSideEncryption: AES256
+  environment:
+    # Used by the db interface when creating the dynamoDb & dynamoDbDoc objects
+    # IS_OFFLINE: set by `serverless-offline` plugin
+
+    #    DEBUG: ${self:custom.env.DEBUG, 'true'}
+    #    TRACE: ${self:custom.env.TRACE, 'false'}
+    VERSION: ${self:custom.package.version}
+
+    APPLICATION_TABLE:                    # used by `db.js`
+      Ref: ApplicationDynamoDBTable
+    API_REGION: ${self:provider.region}   # used by `websocket-client.js`
+  tags:
+    RUNTIME: ${self:custom.runtime}
+    PROJECT: ${self:service}
+
+  # CFN stack config
+  stackName: ${self:provider.stage}-${self:service}
+
+  # Lambda specific configuration
+  runtime: ${self:custom.runtime}
+  memorySize: 512       # optional, in MB, default is 1024
+  timeout: 10           # optional, in seconds, default is 6
+  logRetentionInDays: 7
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - "execute-api:ManageConnections"
+      Resource:
+        - "arn:aws:execute-api:*:*:**/@connections/*"
+    - Effect: Allow
+      Action:
+        - "dynamodb:PutItem"
+        - "dynamodb:GetItem"
+        - "dynamodb:UpdateItem"
+        - "dynamodb:DeleteItem"
+        - "dynamodb:BatchGetItem"
+        - "dynamodb:BatchWriteItem"
+        - "dynamodb:Query"
+      Resource:
+        - Fn::GetAtt: [ApplicationDynamoDBTable, Arn]
+        - Fn::Join:
+            - '/'
+            - - Fn::GetAtt: [ApplicationDynamoDBTable, Arn]
+              - '*'
+
+  # Websockets stuff
+  websocketApiName: ${self:provider.stage}-${self:service}-api   # optional
+
+  # required for websocket apis
+  # this selects from your payload what your "routeKey" parameter is
+  # from the websocket event types on your function
+  websocketApiRouteSelectionExpression: $request.body.action
+
 functions:
-  connectionHandler:
-    handler: src/handler.main
+  # manage connection and disconnection of clients
+  connectionManager:
+    handler: src/handler.connectionManager
     events:
       - websocket:
           routeKey: $connect
       - websocket:
           routeKey: $disconnect
+
+  # just in case we are getting weird / bad data
+  # we can react to it with a sane response
   defaultHandler:
+    handler: src/handler.defaultMessage
     events:
       - websocket:
           routeKey: $default
-  actionHandler:
+
+  # handle chat app messages
+  sendMessage:
+    handler: src/handler.sendMessage
     events:
       - websocket:
-          routeKey: myAction
+          routeKey: sendMessage
+
+  # Channel Subscriptions
+  channelManager:
+    handler: src/handler.channelManager
+    events:
+      - websocket:
+          routeKey: subscribeChannel
+      - websocket:
+          routeKey: unsubscribeChannel
+
+  # handle broadcasting all events
+  # we do this by listening the dynamodb table stream for messages or disconnects
+  # could even be done by sub-systems directly to dynamodb
+  broadcast:
+    handler: src/handler.broadcast
+    events:
+      - stream:
+          type: dynamodb
+          arn:
+            Fn::GetAtt: [ApplicationDynamoDBTable, StreamArn]
+
+resources:
+  Resources:
+    # DynamoDB best practices suggest most applications should only
+    # have a single table. For resources check out the follow links...
+    # https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/best-practices.html
+    # Advanced Design Patterns for DynamoDB - https://www.youtube.com/watch?v=HaEPXoXVf2k
+    ApplicationDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.stage}-${self:service}-data
+        BillingMode: PAY_PER_REQUEST
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+        AttributeDefinitions:
+          - AttributeName: pk
+            AttributeType: S
+          - AttributeName: sk
+            AttributeType: S
+        KeySchema:
+          - AttributeName: pk
+            KeyType: HASH
+          - AttributeName: sk
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: reverse
+            KeySchema:
+              - AttributeName: sk
+                KeyType: HASH
+              - AttributeName: pk
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
